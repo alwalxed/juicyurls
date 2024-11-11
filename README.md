@@ -26,7 +26,7 @@ By default, all categories are checked.
 
 ## Examples
 
-```
+```javascript
 // Typical scan
 juicyurls -l urls.txt
 
@@ -46,4 +46,4 @@ Contributions are welcome via pull requests.
 
 ## License
 
-[MIT License](https://github.com/alwalxed/juicyurls/blob/main/LICENSE)
+[MIT](https://github.com/alwalxed/juicyurls/blob/main/LICENSE)
