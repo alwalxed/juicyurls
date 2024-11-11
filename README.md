@@ -10,7 +10,7 @@ go install github.com/alwalxed/juicyurls@latest
 
 ## Usage
 
-```
+```plaintext
 juicyurls [options]
 
 Options:
