@@ -26,17 +26,19 @@ By default, all categories are checked.
 
 ## Examples
 
-Scan URLs:
-`juicyurls -l urls.txt`
+```
+// Typical scan
+juicyurls -l urls.txt
 
-Scan specific categories:
-`juicyurls -l urls.txt -m keywords,paths`
+// Scan specific categories
+juicyurls -l urls.txt -m keywords,paths
 
-Exclude patterns:
-`juicyurls -l urls.txt -e .js,.css`
+// Exclude patterns
+juicyurls -l urls.txt -e .js,.css
 
-Save results:
-`juicyurls -l urls.txt -o suspicious_urls.txt`
+// Save output
+juicyurls -l urls.txt -o output.txt
+```
 
 ## Contributing
 
