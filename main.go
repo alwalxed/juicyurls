@@ -38,7 +38,6 @@ func (c *URLChecker) isSuspicious(url string) bool {
 
 	urlLower := strings.ToLower(strings.TrimSpace(url))
 
-	// Check excludes first
 	for _, exclude := range c.excludePatterns {
 		if strings.Contains(urlLower, strings.ToLower(exclude)) {
 			return false
@@ -210,7 +209,6 @@ func main() {
 		printUsage()
 	}
 
-	// set default checking configuration
 	config.urlChecker = URLChecker{
 		checkKeywords:   true,
 		checkExtensions: true,
@@ -218,14 +216,13 @@ func main() {
 		checkHidden:     true,
 	}
 
-	// handle excludes
 	if config.excludes != "" {
 		config.urlChecker.excludePatterns = strings.Split(config.excludes, ",")
 	}
 
 	if config.categories != "" {
 		config.urlChecker = URLChecker{
-			excludePatterns: config.urlChecker.excludePatterns, // preserve excludes
+			excludePatterns: config.urlChecker.excludePatterns,
 		}
 		categories := strings.Split(config.categories, ",")
 		for _, category := range categories {
