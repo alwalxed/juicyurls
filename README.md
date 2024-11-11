@@ -26,17 +26,17 @@ By default, all categories are checked.
 
 ## Examples
 
-```javascript
-// Typical scan
+```bash
+# Typical scan
 juicyurls -l urls.txt
 
-// Scan specific categories
+# Scan specific categories
 juicyurls -l urls.txt -m keywords,paths
 
-// Exclude patterns
+# Exclude patterns
 juicyurls -l urls.txt -e .js,.css
 
-// Save output
+# Save output
 juicyurls -l urls.txt -o output.txt
 ```
 
