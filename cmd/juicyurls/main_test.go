@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/alwalxed/juicyurls/suspicious"
+	"github.com/alwalxed/juicyurls/v2/suspicious"
 )
 
 // TestIsValidURL covers various valid/invalid URL cases

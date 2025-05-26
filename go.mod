@@ -1,5 +1,3 @@
-module juicyurls
+module github.com/alwalxed/juicyurls/v2
 
 go 1.22.5
-
-require github.com/alwalxed/juicyurls v1.1.0
