@@ -20,7 +20,7 @@ A powerful and fast CLI tool for scanning and identifying **suspicious URLs**. I
 ## Installation
 
 ```bash
-go install github.com/alwalxed/juicyurls@latest
+go install github.com/alwalxed/juicyurls/v2@latest
 ```
 
 ## Usage

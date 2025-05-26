@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/alwalxed/juicyurls/suspicious"
+	"github.com/alwalxed/juicyurls/v2/suspicious"
 )
 
 // URLChecker handles URL validation and suspicious pattern detection
