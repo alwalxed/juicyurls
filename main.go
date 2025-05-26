@@ -20,11 +20,12 @@ import (
 )
 
 const (
-	maxURLLength   = 2048
-	maxFileSize    = 100 * 1024 * 1024 // 100MB limit
-	bufferSize     = 64 * 1024         // 64KB buffer
-	defaultTimeout = 30 * time.Second
-	maxWorkers     = 100
+	maxURLLength     = 2048
+	maxFileSize      = 500 * 1024 * 1024 // 500MB limit (increased)
+	bufferSize       = 1024 * 1024       // 1MB buffer (increased)
+	defaultTimeout   = 300 * time.Second // 5 minutes default (increased)
+	maxWorkers       = 500               // Increased max workers
+	progressInterval = 10000             // Report progress every 10k URLs
 )
 
 // URLChecker handles URL validation and suspicious pattern detection
@@ -68,7 +69,27 @@ type Stats struct {
 	SuspiciousURLs int
 	InvalidURLs    int
 	ProcessedURLs  int
+	SkippedURLs    int
 	Duration       time.Duration
+	ProcessingRate float64
+	mutex          sync.RWMutex
+}
+
+// UpdateStats safely updates statistics
+func (s *Stats) UpdateStats(suspicious, invalid, processed, skipped int) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	s.SuspiciousURLs += suspicious
+	s.InvalidURLs += invalid
+	s.ProcessedURLs += processed
+	s.SkippedURLs += skipped
+}
+
+// GetStats safely reads statistics
+func (s *Stats) GetStats() (int, int, int, int) {
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
+	return s.SuspiciousURLs, s.InvalidURLs, s.ProcessedURLs, s.SkippedURLs
 }
 
 // isValidURL performs basic URL validation
@@ -178,39 +199,64 @@ func (c *URLChecker) isSuspicious(rawURL string) (bool, string, string) {
 	return false, "", ""
 }
 
-// worker processes URLs from the input channel
+// worker processes URLs from the input channel with improved error handling
 func worker(ctx context.Context, id int, urls <-chan string, results chan<- Result,
 	checker *URLChecker, config *Config, stats *Stats, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	localStats := struct {
+		suspicious, invalid, processed, skipped int
+	}{}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			stats.UpdateStats(localStats.suspicious, localStats.invalid, localStats.processed, localStats.skipped)
 			return
+		case <-ticker.C:
+			// Periodically update global stats
+			stats.UpdateStats(localStats.suspicious, localStats.invalid, localStats.processed, localStats.skipped)
+			localStats = struct{ suspicious, invalid, processed, skipped int }{}
 		case rawURL, ok := <-urls:
 			if !ok {
+				stats.UpdateStats(localStats.suspicious, localStats.invalid, localStats.processed, localStats.skipped)
 				return
 			}
 
+			// Skip empty URLs quickly
+			if strings.TrimSpace(rawURL) == "" {
+				localStats.skipped++
+				continue
+			}
+
 			if config.validateURLs && !isValidURL(rawURL) {
-				stats.InvalidURLs++
+				localStats.invalid++
+				localStats.processed++
 				continue
 			}
 
 			if suspicious, category, reason := checker.isSuspicious(rawURL); suspicious {
-				results <- Result{
+				select {
+				case results <- Result{
 					URL:      rawURL,
 					Category: category,
 					Reason:   reason,
+				}:
+					localStats.suspicious++
+				case <-ctx.Done():
+					stats.UpdateStats(localStats.suspicious, localStats.invalid, localStats.processed, localStats.skipped)
+					return
 				}
-				stats.SuspiciousURLs++
 			}
-			stats.ProcessedURLs++
+			localStats.processed++
 		}
 	}
 }
 
-// processURLs processes URLs concurrently with context cancellation
+// processURLs processes URLs concurrently with progress reporting
 func processURLs(ctx context.Context, urls []string, checker *URLChecker,
 	config *Config) ([]Result, *Stats, error) {
 	stats := &Stats{
@@ -220,7 +266,14 @@ func processURLs(ctx context.Context, urls []string, checker *URLChecker,
 	startTime := time.Now()
 	defer func() {
 		stats.Duration = time.Since(startTime)
+		if stats.Duration.Seconds() > 0 {
+			stats.ProcessingRate = float64(stats.ProcessedURLs) / stats.Duration.Seconds()
+		}
 	}()
+
+	if len(urls) == 0 {
+		return nil, stats, nil
+	}
 
 	numWorkers := config.workers
 	if numWorkers <= 0 {
@@ -230,8 +283,18 @@ func processURLs(ctx context.Context, urls []string, checker *URLChecker,
 		numWorkers = maxWorkers
 	}
 
-	urlChan := make(chan string, numWorkers*2)
-	resultsChan := make(chan Result, len(urls))
+	// Optimize worker count based on workload
+	if len(urls) < 1000 {
+		numWorkers = min(numWorkers, len(urls)/10+1)
+	}
+
+	if config.verbose {
+		fmt.Printf("Processing %d URLs with %d workers...\n", len(urls), numWorkers)
+	}
+
+	// Use buffered channels to reduce blocking
+	urlChan := make(chan string, numWorkers*4)
+	resultsChan := make(chan Result, numWorkers*2)
 
 	var wg sync.WaitGroup
 
@@ -241,14 +304,50 @@ func processURLs(ctx context.Context, urls []string, checker *URLChecker,
 		go worker(ctx, i, urlChan, resultsChan, checker, config, stats, &wg)
 	}
 
-	// Send URLs to workers
+	// Progress reporting goroutine
+	var progressWG sync.WaitGroup
+	if config.verbose {
+		progressWG.Add(1)
+		go func() {
+			defer progressWG.Done()
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					// Fix: Use blank identifier for unused return values
+					suspiciousCount, _, processedCount, _ := stats.GetStats()
+					elapsed := time.Since(startTime)
+					rate := float64(processedCount) / elapsed.Seconds()
+					fmt.Printf("Progress: %d/%d processed (%.1f%%), %d suspicious, %.0f URLs/sec\n",
+						processedCount, len(urls), float64(processedCount)*100/float64(len(urls)),
+						suspiciousCount, rate)
+				}
+			}
+		}()
+	}
+
+	// Send URLs to workers with batching
 	go func() {
 		defer close(urlChan)
-		for _, url := range urls {
-			select {
-			case <-ctx.Done():
-				return
-			case urlChan <- url:
+		batch := make([]string, 0, 100)
+
+		for i, url := range urls {
+			batch = append(batch, url)
+
+			// Send batch or when we reach the end
+			if len(batch) >= 100 || i == len(urls)-1 {
+				for _, batchURL := range batch {
+					select {
+					case <-ctx.Done():
+						return
+					case urlChan <- batchURL:
+					}
+				}
+				batch = batch[:0] // Reset batch
 			}
 		}
 	}()
@@ -264,7 +363,24 @@ func processURLs(ctx context.Context, urls []string, checker *URLChecker,
 		results = append(results, result)
 	}
 
+	progressWG.Wait()
+
+	if config.verbose {
+		// These variables are used in the fmt.Printf, so no blank identifier needed here.
+		suspicious, invalid, processed, skipped := stats.GetStats()
+		fmt.Printf("Final: %d processed, %d suspicious, %d invalid, %d skipped\n",
+			processed, suspicious, invalid, skipped)
+	}
+
 	return results, stats, ctx.Err()
+}
+
+// Helper function for min
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // writeResults writes results to output file or stdout
@@ -323,7 +439,7 @@ func validateFile(filePath string) error {
 	return nil
 }
 
-// processFile reads and processes URLs from input file
+// processFile reads and processes URLs from input file with streaming
 func processFile(ctx context.Context, config *Config) error {
 	if err := validateFile(config.filePath); err != nil {
 		return err
@@ -335,6 +451,20 @@ func processFile(ctx context.Context, config *Config) error {
 	}
 	defer file.Close()
 
+	if config.verbose {
+		info, _ := file.Stat()
+		fmt.Printf("Processing file: %s (%.2f MB)\n", config.filePath, float64(info.Size())/(1024*1024))
+	}
+
+	// For very large files, process in chunks
+	fileInfo, _ := file.Stat()
+	isLargeFile := fileInfo.Size() > 50*1024*1024 // 50MB
+
+	if isLargeFile {
+		return processLargeFile(ctx, file, config)
+	}
+
+	// Load all URLs for smaller files
 	var urls []string
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, bufferSize), bufferSize)
@@ -342,19 +472,25 @@ func processFile(ctx context.Context, config *Config) error {
 	lineCount := 0
 	for scanner.Scan() {
 		lineCount++
-		if url := strings.TrimSpace(scanner.Text()); url != "" {
-			// Skip comments and empty lines
-			if !strings.HasPrefix(url, "#") && !strings.HasPrefix(url, "//") {
-				urls = append(urls, url)
-			}
+		line := strings.TrimSpace(scanner.Text())
+
+		// Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
 		}
 
-		// Check context cancellation periodically
-		if lineCount%1000 == 0 {
+		urls = append(urls, line)
+
+		// Periodic context check for large number of URLs
+		if lineCount%progressInterval == 0 {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
+			}
+
+			if config.verbose {
+				fmt.Printf("Loaded %d URLs...\n", len(urls))
 			}
 		}
 	}
@@ -368,9 +504,12 @@ func processFile(ctx context.Context, config *Config) error {
 	}
 
 	results, stats, err := processURLs(ctx, urls, &config.urlChecker, config)
-	if err != nil {
+	if err != nil && err != context.DeadlineExceeded {
 		return fmt.Errorf("error processing URLs: %w", err)
 	}
+
+	// Remove duplicates
+	results = removeDuplicates(results)
 
 	if config.verbose {
 		printStats(stats)
@@ -379,15 +518,116 @@ func processFile(ctx context.Context, config *Config) error {
 	return writeResults(results, config.outputPath, config.verbose)
 }
 
+// processLargeFile handles very large files with streaming processing
+func processLargeFile(ctx context.Context, file *os.File, config *Config) error {
+	if config.verbose {
+		fmt.Println("Using streaming mode for large file...")
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, bufferSize), bufferSize)
+
+	// Process in chunks
+	chunkSize := 50000 // Process 50k URLs at a time
+	chunk := make([]string, 0, chunkSize)
+	allResults := make([]Result, 0)
+	totalStats := &Stats{}
+
+	lineCount := 0
+	for scanner.Scan() {
+		lineCount++
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
+			continue
+		}
+
+		chunk = append(chunk, line)
+
+		// Process chunk when full
+		if len(chunk) >= chunkSize {
+			if config.verbose {
+				fmt.Printf("Processing chunk %d-%d...\n", lineCount-len(chunk)+1, lineCount)
+			}
+
+			results, stats, err := processURLs(ctx, chunk, &config.urlChecker, config)
+			if err != nil && err != context.DeadlineExceeded {
+				return fmt.Errorf("error processing chunk: %w", err)
+			}
+
+			allResults = append(allResults, results...)
+			totalStats.TotalURLs += stats.TotalURLs
+			totalStats.ProcessedURLs += stats.ProcessedURLs
+			totalStats.SuspiciousURLs += stats.SuspiciousURLs
+			totalStats.InvalidURLs += stats.InvalidURLs
+			totalStats.Duration += stats.Duration
+
+			chunk = chunk[:0] // Reset chunk
+
+			// Check context
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+		}
+	}
+
+	// Process remaining URLs
+	if len(chunk) > 0 {
+		if config.verbose {
+			fmt.Printf("Processing final chunk of %d URLs...\n", len(chunk))
+		}
+
+		results, stats, err := processURLs(ctx, chunk, &config.urlChecker, config)
+		if err != nil && err != context.DeadlineExceeded {
+			return fmt.Errorf("error processing final chunk: %w", err)
+		}
+
+		allResults = append(allResults, results...)
+		totalStats.TotalURLs += stats.TotalURLs
+		totalStats.ProcessedURLs += stats.ProcessedURLs
+		totalStats.SuspiciousURLs += stats.SuspiciousURLs
+		totalStats.InvalidURLs += stats.InvalidURLs
+		totalStats.Duration += stats.Duration
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading file: %w", err)
+	}
+
+	// Remove duplicates from all results
+	allResults = removeDuplicates(allResults)
+
+	if config.verbose {
+		printStats(totalStats)
+	}
+
+	return writeResults(allResults, config.outputPath, config.verbose)
+}
+
 // printStats displays scanning statistics
 func printStats(stats *Stats) {
-	fmt.Printf("\nScan Statistics:\n")
-	fmt.Printf("  Total URLs: %d\n", stats.TotalURLs)
-	fmt.Printf("  Processed URLs: %d\n", stats.ProcessedURLs)
-	fmt.Printf("  Suspicious URLs: %d\n", stats.SuspiciousURLs)
-	fmt.Printf("  Invalid URLs: %d\n", stats.InvalidURLs)
-	fmt.Printf("  Duration: %v\n", stats.Duration)
-	fmt.Printf("  Rate: %.2f URLs/sec\n", float64(stats.ProcessedURLs)/stats.Duration.Seconds())
+	fmt.Printf("\n=== Scan Statistics ===\n")
+	fmt.Printf("Total URLs: %d\n", stats.TotalURLs)
+	fmt.Printf("Processed URLs: %d\n", stats.ProcessedURLs)
+	fmt.Printf("Suspicious URLs: %d\n", stats.SuspiciousURLs)
+	fmt.Printf("Invalid URLs: %d\n", stats.InvalidURLs)
+	fmt.Printf("Skipped URLs: %d\n", stats.SkippedURLs)
+	fmt.Printf("Duration: %v\n", stats.Duration)
+	if stats.ProcessingRate > 0 {
+		fmt.Printf("Processing Rate: %.0f URLs/sec\n", stats.ProcessingRate)
+	}
+	fmt.Printf("Success Rate: %.2f%%\n", float64(stats.SuspiciousURLs)*100/float64(max(stats.ProcessedURLs, 1)))
+	fmt.Printf("========================\n")
+}
+
+// Helper function for max
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // removeDuplicates removes duplicate URLs while preserving order
@@ -417,7 +657,7 @@ func printUsage() {
 	fmt.Println("  -o <path>        Output file path (default: stdout)")
 	fmt.Println("  -e <patterns>    Comma-separated patterns to exclude")
 	fmt.Println("  -w <number>      Number of worker goroutines (default: CPU cores)")
-	fmt.Println("  -t <duration>    Timeout for processing (default: 30s)")
+	fmt.Println("  -t <duration>    Timeout for processing (default: 5m)")
 	fmt.Println("  -v               Verbose output with statistics")
 	fmt.Println("  -validate        Validate URL format before processing")
 	fmt.Println("\nCategories: keywords, extensions, paths, hidden")
@@ -438,8 +678,8 @@ func main() {
 	flag.StringVar(&config.categories, "m", "", "Categories to check")
 	flag.StringVar(&config.outputPath, "o", "", "Output file path")
 	flag.StringVar(&config.excludes, "e", "", "Exclude patterns")
-	flag.IntVar(&config.workers, "w", 0, "Number of workers")
-	flag.StringVar(&timeoutStr, "t", "30s", "Processing timeout")
+	flag.IntVar(&config.workers, "w", 0, "Number of workers (default: CPU cores)")
+	flag.StringVar(&timeoutStr, "t", "300s", "Processing timeout (default: 5m)")
 	flag.BoolVar(&config.verbose, "v", false, "Verbose output")
 	flag.BoolVar(&config.validateURLs, "validate", false, "Validate URL format")
 
